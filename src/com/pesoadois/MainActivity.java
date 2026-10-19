@@ -3,6 +3,9 @@ package com.pesoadois;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DatePickerDialog;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
+import android.net.Uri;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -32,6 +35,11 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.pesoadois.core.ChartMath;
+import com.pesoadois.core.AdbBackupReader;
+import com.pesoadois.core.BackupCodec;
+import com.pesoadois.core.BackupException;
+import com.pesoadois.core.CsvExport;
+import com.pesoadois.core.LegacyImport;
 import com.pesoadois.core.DateText;
 import com.pesoadois.core.Diary;
 import com.pesoadois.core.Entry;
@@ -46,6 +54,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 /** Diário local de pesos para duas pessoas. Nenhum dado sai do aparelho. */
 public final class MainActivity extends Activity {
@@ -67,6 +81,18 @@ public final class MainActivity extends Activity {
     private static final String STATE_SELECTED = "selected_at";
     private static final String STATE_MANUAL = "manual_date";
     private static final String STATE_HISTORY = "history_days";
+    private static final int MENU_EXPORT_JSON = 1;
+    private static final int MENU_IMPORT = 2;
+    private static final int MENU_EXPORT_CSV = 3;
+    private static final int MENU_ABOUT = 4;
+    private static final int REQ_EXPORT_JSON = 41;
+    private static final int REQ_EXPORT_CSV = 42;
+    private static final int REQ_IMPORT = 43;
+    private static final int IMPORT_LIMIT_BYTES = 10 * 1024 * 1024;
+    private static final String ADB_DATA_SUFFIX = "/sp/peso_a_dois_dados.xml";
+    private static final String KEY_REMIND_UNTIL = "remind_until";
+    private static final long REMIND_AFTER_MS = 30 * DAY_MS;
+    private static final int REMIND_MIN_ENTRIES = 5;
 
     private static final class PersonCard {
         TextView name;
@@ -106,6 +132,7 @@ public final class MainActivity extends Activity {
     private LinearLayout noticeCard;
     private TextView noticeText;
     private LinearLayout emptyCard;
+    private LinearLayout reminderCard;
     private TextView dateText;
     private Button todayButton;
     private EditText elisaInput;
@@ -211,6 +238,8 @@ public final class MainActivity extends Activity {
         noticeCard.addView(ok, lp(-2, dp(48), 8));
         root.addView(noticeCard, lp(-1, -2, 16));
 
+        reminderCard = buildReminderCard();
+        root.addView(reminderCard, lp(-1, -2, 16));
         emptyCard = card();
         TextView eyebrow = label("DIÁRIO DO CASAL", 11, palette.gold, true);
         eyebrow.setLetterSpacing(.12f);
@@ -218,6 +247,9 @@ public final class MainActivity extends Activity {
         emptyCard.addView(label("Como vocês estão evoluindo?", 20, palette.ink, true), lp(-1, -2, 5));
         emptyCard.addView(label("Registre os dois pesos juntos e acompanhe a história em um só lugar.\n"
                 + "Tudo fica salvo apenas neste celular.", 14, palette.muted, false), lp(-1, -2, 5));
+        Button importButton = button("Importar backup", palette.primary, palette.onPrimary, true);
+        importButton.setOnClickListener(v -> launchImport());
+        emptyCard.addView(importButton, lp(-1, dp(48), 14));
         root.addView(emptyCard, lp(-1, -2, 16));
 
         root.addView(sectionTitle("Nova marcação"), lp(-1, -2, 22));
@@ -279,16 +311,6 @@ public final class MainActivity extends Activity {
         menu.setOnClickListener(this::showMenu);
         header.addView(menu, new LinearLayout.LayoutParams(dp(48), dp(48)));
         return header;
-    }
-
-    private void showMenu(View anchor) {
-        PopupMenu popup = new PopupMenu(this, anchor);
-        popup.getMenu().add(0, 1, 0, "Sobre");
-        popup.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 1) showAbout();
-            return true;
-        });
-        popup.show();
     }
 
     private View sectionTitle(String text) {
@@ -501,6 +523,7 @@ public final class MainActivity extends Activity {
         subtitle.setText(subtitleText());
         noticeCard.setVisibility(notice != null ? View.VISIBLE : View.GONE);
         if (notice != null) noticeText.setText(notice);
+        reminderCard.setVisibility(shouldRemind(now) ? View.VISIBLE : View.GONE);
         emptyCard.setVisibility(diary.isEmpty() ? View.VISIBLE : View.GONE);
         dateText.setText(manualDate ? "📅  " + DateText.fullDate(selectedAt)
                 : "📅  Hoje · " + DateText.fullDate(now));
@@ -1088,19 +1111,320 @@ public final class MainActivity extends Activity {
         dialog.show();
     }
 
-    private void showAbout() {
-        new AlertDialog.Builder(this)
-                .setTitle("Peso a dois")
-                .setMessage("Versão " + versionName() + "\n\nSeus dados ficam apenas neste aparelho.")
-                .setPositiveButton("Entendi", null)
-                .show();
-    }
-
     private String versionName() {
         try {
             return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (PackageManager.NameNotFoundException error) {
             return "?";
+        }
+    }
+
+    // ------------------------------------------------------------------ menu, backup, importação e planilha
+
+    private void showMenu(View anchor) {
+        PopupMenu popup = new PopupMenu(this, anchor);
+        popup.getMenu().add(0, MENU_EXPORT_JSON, 0, "Exportar backup (.json)");
+        popup.getMenu().add(0, MENU_IMPORT, 1, "Importar backup");
+        popup.getMenu().add(0, MENU_EXPORT_CSV, 2, "Exportar planilha (.csv)");
+        popup.getMenu().add(0, MENU_ABOUT, 3, "Sobre");
+        popup.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+                case MENU_EXPORT_JSON: startExportJson(); return true;
+                case MENU_IMPORT: launchImport(); return true;
+                case MENU_EXPORT_CSV: startExportCsv(); return true;
+                case MENU_ABOUT: showAbout(); return true;
+                default: return false;
+            }
+        });
+        popup.show();
+    }
+
+    private void startExportJson() {
+        String title = "peso-a-dois-backup-" + DateText.isoDate(System.currentTimeMillis()) + ".json";
+        launch(documentIntent("application/json", title), REQ_EXPORT_JSON);
+    }
+
+    private void startExportCsv() {
+        String title = "peso-a-dois-" + DateText.isoDate(System.currentTimeMillis()) + ".csv";
+        launch(documentIntent("text/csv", title), REQ_EXPORT_CSV);
+    }
+
+    private void launchImport() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "application/json", "text/plain", "application/octet-stream", "text/xml", "application/xml"});
+        launch(intent, REQ_IMPORT);
+    }
+
+    private Intent documentIntent(String type, String title) {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(type);
+        intent.putExtra(Intent.EXTRA_TITLE, title);
+        return intent;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void launch(Intent intent, int requestCode) {
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (ActivityNotFoundException error) {
+            toast("Nenhum gerenciador de arquivos disponível.");
+        }
+    }
+
+    @Override @SuppressWarnings("deprecation")
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        if (requestCode == REQ_EXPORT_JSON) {
+            exportJson(uri, diary.copy());
+        } else if (requestCode == REQ_EXPORT_CSV) {
+            exportCsv(uri, diary.copy());
+        } else if (requestCode == REQ_IMPORT) {
+            importFrom(uri, System.currentTimeMillis());
+        }
+    }
+
+    /** Grava o backup em segundo plano, relê e confere a contagem antes de dar sucesso. */
+    private void exportJson(Uri uri, Diary snapshot) {
+        new Thread(() -> {
+            long now = System.currentTimeMillis();
+            try {
+                writeBytes(uri, BackupCodec.encode(snapshot, now).getBytes(StandardCharsets.UTF_8));
+                int count = readBackupCount(uri, now);
+                if (count != snapshot.size()) {
+                    showOnUi("Não consegui verificar o backup gravado. Tente salvar de novo.");
+                    return;
+                }
+                onUi(() -> markBackupSaved(count, now));
+            } catch (BackupException error) {
+                showOnUi(error.getMessage());
+            } catch (IOException | RuntimeException error) {
+                showOnUi("Não consegui salvar o backup. Verifique o espaço livre e tente de novo.");
+            }
+        }).start();
+    }
+
+    private void exportCsv(Uri uri, Diary snapshot) {
+        new Thread(() -> {
+            try {
+                writeBytes(uri, CsvExport.toCsv(snapshot).getBytes(StandardCharsets.UTF_8));
+                showOnUi("Planilha salva: " + snapshot.size() + " marcações.");
+            } catch (IOException | RuntimeException error) {
+                showOnUi("Não consegui salvar a planilha. Verifique o espaço livre e tente de novo.");
+            }
+        }).start();
+    }
+
+    private void importFrom(Uri uri, long now) {
+        new Thread(() -> {
+            try {
+                ImportPlan plan = parseImport(readUri(uri), now);
+                onUi(() -> showImportSummary(plan));
+            } catch (BackupException error) {
+                showOnUi(error.getMessage());
+            } catch (IOException | RuntimeException error) {
+                showOnUi("Não consegui ler o arquivo escolhido.");
+            }
+        }).start();
+    }
+
+    private void markBackupSaved(int count, long now) {
+        Diary next = diary.copy();
+        next.lastBackupAt = now;
+        if (commit(next)) {
+            refreshUi(false);
+            toast("Backup salvo e verificado: " + count + " marcações.");
+        }
+    }
+
+    private void showImportSummary(ImportPlan plan) {
+        Diary imported = plan.diary;
+        long first = Long.MAX_VALUE;
+        long last = Long.MIN_VALUE;
+        for (Entry entry : imported.all()) {
+            first = Math.min(first, entry.at);
+            last = Math.max(last, entry.at);
+        }
+        String message = "Encontrei " + imported.size() + " marcações ("
+                + imported.person(Diary.ELISA).name + ": " + imported.of(Diary.ELISA).size() + ", "
+                + imported.person(Diary.LUCAS).name + ": " + imported.of(Diary.LUCAS).size() + "), de "
+                + DateText.shortDate(first) + " a " + DateText.shortDate(last) + ".";
+        if (plan.skipped > 0) {
+            message += " " + plan.skipped + " entradas inválidas foram ignoradas.";
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Importar backup")
+                .setMessage(message);
+        if (diary.isEmpty()) {
+            builder.setPositiveButton("Importar", (dialog, which) -> applyImport(plan, true));
+        } else {
+            builder.setPositiveButton("Substituir tudo", (dialog, which) -> applyImport(plan, true));
+            builder.setNeutralButton("Juntar", (dialog, which) -> applyImport(plan, false));
+        }
+        builder.setNegativeButton("Cancelar", null).show();
+    }
+
+    private void applyImport(ImportPlan plan, boolean replace) {
+        if (!store.saveCopy(diary, "antes-da-importacao.json")) {
+            toast("Não consegui guardar uma cópia de segurança. Importação cancelada.");
+            return;
+        }
+        Diary next;
+        int changed;
+        if (replace) {
+            next = plan.diary.copy();
+            next.lastBackupAt = diary.lastBackupAt;
+            changed = next.size();
+        } else {
+            next = diary.copy();
+            changed = next.merge(plan.diary);
+        }
+        if (!commit(next)) return;
+        refreshUi(true);
+        toast(replace ? "Importadas " + changed + " marcações." : changed + " novas marcações adicionadas.");
+    }
+
+    private static ImportPlan parseImport(byte[] bytes, long now) throws BackupException {
+        Diary imported;
+        int skipped = 0;
+        if (AdbBackupReader.looksLikeAdbBackup(bytes)) {
+            byte[] xml = AdbBackupReader.extract(new ByteArrayInputStream(bytes), ADB_DATA_SUFFIX, IMPORT_LIMIT_BYTES);
+            if (xml == null) {
+                throw new BackupException("Esse backup do adb não contém dados do Peso a dois.");
+            }
+            imported = LegacyImport.fromPrefsMap(LegacyImport.parsePrefsXml(new String(xml, StandardCharsets.UTF_8)));
+        } else {
+            String text = new String(bytes, StandardCharsets.UTF_8);
+            if (text.length() > 0 && text.charAt(0) == '﻿') text = text.substring(1);
+            String trimmed = text.trim();
+            if (trimmed.startsWith("<")) {
+                imported = LegacyImport.fromPrefsMap(LegacyImport.parsePrefsXml(trimmed));
+            } else {
+                BackupCodec.Result result = BackupCodec.decode(trimmed, now);
+                imported = result.diary;
+                skipped = result.skipped;
+            }
+        }
+        if (imported.isEmpty()) {
+            throw new BackupException("Nenhuma marcação válida encontrada no arquivo.");
+        }
+        return new ImportPlan(imported, skipped);
+    }
+
+    private int readBackupCount(Uri uri, long now) throws IOException, BackupException {
+        BackupCodec.Result result = BackupCodec.decode(new String(readUri(uri), StandardCharsets.UTF_8), now);
+        return result.skipped == 0 ? result.diary.size() : -1;
+    }
+
+    private byte[] readUri(Uri uri) throws IOException, BackupException {
+        InputStream in = getContentResolver().openInputStream(uri);
+        if (in == null) throw new IOException("Arquivo indisponível");
+        try {
+            return readAll(in, IMPORT_LIMIT_BYTES);
+        } finally {
+            in.close();
+        }
+    }
+
+    private static byte[] readAll(InputStream in, int limit) throws IOException, BackupException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        long total = 0;
+        int count;
+        while ((count = in.read(buffer)) >= 0) {
+            total += count;
+            if (total > limit) throw new BackupException("Arquivo grande demais para importar (limite de 10 MB).");
+            out.write(buffer, 0, count);
+        }
+        return out.toByteArray();
+    }
+
+    private void writeBytes(Uri uri, byte[] bytes) throws IOException {
+        OutputStream out = openForWrite(uri);
+        try {
+            out.write(bytes);
+            out.flush();
+        } finally {
+            out.close();
+        }
+    }
+
+    private OutputStream openForWrite(Uri uri) throws IOException {
+        OutputStream out = null;
+        try {
+            out = getContentResolver().openOutputStream(uri, "wt");
+        } catch (IOException | IllegalArgumentException error) {
+            out = null;
+        }
+        if (out == null) out = getContentResolver().openOutputStream(uri, "w");
+        if (out == null) throw new IOException("Destino indisponível");
+        return out;
+    }
+
+    /** Executa uma ação na UI thread, mas só se a tela ainda existir. */
+    private void onUi(Runnable action) {
+        runOnUiThread(() -> {
+            if (!isFinishing() && !isDestroyed()) action.run();
+        });
+    }
+
+    private void showOnUi(String text) {
+        onUi(() -> toast(text));
+    }
+
+    private void toast(String text) {
+        Toast.makeText(this, text, Toast.LENGTH_LONG).show();
+    }
+
+    private LinearLayout buildReminderCard() {
+        LinearLayout box = card();
+        box.addView(label("Seus dados ficam só neste celular. Faça um backup de vez em quando.",
+                14, palette.ink, false));
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button export = button("Exportar agora", palette.primary, palette.onPrimary, true);
+        export.setOnClickListener(v -> startExportJson());
+        actions.addView(export, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        actions.addView(space(8, 1));
+        Button later = button("Depois", palette.field, palette.ink, false);
+        later.setOnClickListener(v -> {
+            ui.edit().putLong(KEY_REMIND_UNTIL, System.currentTimeMillis() + 7 * DAY_MS).apply();
+            refreshUi(false);
+        });
+        actions.addView(later, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        box.addView(actions, lp(-1, -2, 12));
+        return box;
+    }
+
+    private boolean shouldRemind(long now) {
+        return diary.size() >= REMIND_MIN_ENTRIES
+                && now - diary.lastBackupAt > REMIND_AFTER_MS
+                && now > ui.getLong(KEY_REMIND_UNTIL, 0L);
+    }
+
+    private void showAbout() {
+        new AlertDialog.Builder(this)
+                .setTitle("Peso a dois")
+                .setMessage("Versão " + versionName() + "\n\nSeus dados ficam apenas neste aparelho. "
+                        + "Exporte um backup regularmente (⋮ > Exportar backup).\n\n"
+                        + "Importar aceita: backup .json deste app, o arquivo .ab de adb backup da versão 1.0 "
+                        + "e o XML de preferências da versão 1.0.")
+                .setPositiveButton("Entendi", null)
+                .show();
+    }
+
+    private static final class ImportPlan {
+        final Diary diary;
+        final int skipped;
+
+        ImportPlan(Diary diary, int skipped) {
+            this.diary = diary;
+            this.skipped = skipped;
         }
     }
 

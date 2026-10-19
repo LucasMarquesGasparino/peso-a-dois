@@ -13,7 +13,7 @@ RESOURCE_SDK_DIR=/data/data/com.termux/files/home/.cache/android-api/android-9
 TOOLS_DIR=/data/data/com.termux/files/usr/bin
 MANIFEST="$PROJECT_DIR/AndroidManifest.xml"
 OUT="$PROJECT_DIR/build"
-DELIVERY_DIR=/storage/emulated/0/Documents
+DELIVERY_DIR=/storage/emulated/0/Documents/APK
 # Keystore fora do repositório (nunca commitar). Mesmo alias e senha das versões anteriores.
 KEY_DIR="$HOME/.android-keys"
 KEYSTORE="$KEY_DIR/peso-a-dois.keystore"

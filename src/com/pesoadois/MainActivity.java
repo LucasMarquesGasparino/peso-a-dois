@@ -5,574 +5,1106 @@ import android.app.AlertDialog;
 import android.app.DatePickerDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.graphics.Canvas;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.Path;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
+import android.graphics.drawable.InsetDrawable;
 import android.os.Bundle;
+import android.text.InputFilter;
 import android.text.InputType;
+import android.text.method.DigitsKeyListener;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.text.SimpleDateFormat;
+import com.pesoadois.core.ChartMath;
+import com.pesoadois.core.DateText;
+import com.pesoadois.core.Diary;
+import com.pesoadois.core.Entry;
+import com.pesoadois.core.PersonInfo;
+import com.pesoadois.core.Stats;
+import com.pesoadois.core.WeightFormat;
+
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Calendar;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /** Diário local de pesos para duas pessoas. Nenhum dado sai do aparelho. */
 public final class MainActivity extends Activity {
-    private static final String PREFS = "peso_a_dois_dados";
-    private static final String KEY_BASE_CUSTOM = "base_custom_";
-    private static final String KEY_BASE_WEIGHT = "base_weight_";
-    private static final String KEY_BASE_DATE = "base_date_";
+    private static final String UI_PREFS = "ui";
+    private static final String KEY_CHART_PERCENT = "chart_percent";
+    private static final String KEY_CHART_RANGE = "chart_range";
     private static final Locale PT_BR = new Locale("pt", "BR");
+    private static final long DAY_MS = 86_400_000L;
+    private static final int MAX_NAME_LENGTH = 30;
+    private static final int HISTORY_FIRST_DAYS = 14;
+    private static final int HISTORY_STEP_DAYS = 30;
+    /** Variação acima deste percentual pede confirmação antes de salvar. */
+    private static final double BIG_CHANGE = 0.08;
+    private static final int[] RANGE_DAYS = {30, 90, 365, 0};
+    private static final String[] RANGE_LABELS = {"30 dias", "90 dias", "1 ano", "Tudo"};
+    private static final String WEIGHT_ERROR = "Digite um peso entre 20 e 400 kgf (ex.: 68,5)";
+    private static final String STATE_ELISA = "elisa_text";
+    private static final String STATE_LUCAS = "lucas_text";
+    private static final String STATE_SELECTED = "selected_at";
+    private static final String STATE_MANUAL = "manual_date";
+    private static final String STATE_HISTORY = "history_days";
 
-    private static final int INK = Color.rgb(28, 45, 36);
-    private static final int MUTED = Color.rgb(108, 125, 115);
-    private static final int BACKGROUND = Color.rgb(247, 246, 241);
-    private static final int SURFACE = Color.WHITE;
-    private static final int BORDER = Color.rgb(221, 231, 224);
-    private static final int GREEN = Color.rgb(46, 125, 90);
-    private static final int GREEN_LIGHT = Color.rgb(220, 239, 227);
-    private static final int CORAL = Color.rgb(228, 111, 91);
-    private static final int CORAL_LIGHT = Color.rgb(253, 232, 226);
-    private static final int GOLD = Color.rgb(181, 126, 57);
+    private static final class PersonCard {
+        TextView name;
+        TextView current;
+        TextView ago;
+        TextView change;
+        TextView base;
+        TextView goalText;
+        LinearLayout goalBar;
+    }
 
+    private static final class Pending {
+        final String person;
+        final double kg;
+
+        Pending(String person, double kg) {
+            this.person = person;
+            this.kg = kg;
+        }
+    }
+
+    private DiaryStore store;
+    private SharedPreferences ui;
+    private Palette palette;
+    private Diary diary = new Diary();
+    private String notice;
+    private long selectedAt;
+    private boolean manualDate;
+    private int historyDays = HISTORY_FIRST_DAYS;
+    private boolean chartPercent;
+    private int chartRange = 90;
+    private String restoredElisa;
+    private String restoredLucas;
+
+    private LinearLayout root;
+    private TextView subtitle;
+    private LinearLayout noticeCard;
+    private TextView noticeText;
+    private LinearLayout emptyCard;
+    private TextView dateText;
+    private Button todayButton;
     private EditText elisaInput;
     private EditText lucasInput;
-    private TextView chosenDate;
+    private TextView elisaName;
+    private TextView lucasName;
+    private TextView elisaLast;
+    private TextView lucasLast;
     private TextView saveStatus;
-    private TextView elisaCurrent;
-    private TextView lucasCurrent;
-    private TextView elisaDelta;
-    private TextView lucasDelta;
-    private TextView elisaPercent;
-    private TextView lucasPercent;
-    private TextView elisaBase;
-    private TextView lucasBase;
-    private LinearLayout historyContainer;
+    private final Map<String, PersonCard> cards = new HashMap<>();
+    private LinearLayout togetherCard;
+    private TextView togetherSince;
+    private TextView togetherPercent;
+    private TextView togetherRecent;
+    private TextView legendElisa;
+    private TextView legendLucas;
     private WeightChart chart;
-    private long selectedAt;
-    private boolean manuallySelectedDate;
+    private TextView[] modeChips;
+    private TextView[] rangeChips;
+    private LinearLayout historyContainer;
+    private Button showMore;
+    private TextView footer;
 
-    @Override public void onCreate(Bundle state) {
+    @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        Window window = getWindow();
-        window.setStatusBarColor(BACKGROUND);
-        window.setNavigationBarColor(BACKGROUND);
-        if (Build.VERSION.SDK_INT >= 23) {
-            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
-        }
+        palette = Palette.of(this);
+        ui = getSharedPreferences(UI_PREFS, MODE_PRIVATE);
+        chartPercent = ui.getBoolean(KEY_CHART_PERCENT, false);
+        chartRange = ui.getInt(KEY_CHART_RANGE, 90);
+        store = new DiaryStore(this);
+        DiaryStore.LoadResult loaded = store.load();
+        diary = loaded.diary;
+        notice = loaded.notice;
         selectedAt = System.currentTimeMillis();
+        if (state != null) restoreState(state);
+        applySystemBars();
         buildScreen();
+        refreshUi(true);
     }
 
     @Override protected void onResume() {
         super.onResume();
-        if (!manuallySelectedDate) {
-            selectedAt = System.currentTimeMillis();
-            if (chosenDate != null) chosenDate.setText("📅  " + fullDate(selectedAt));
-        }
+        if (root == null) return;
+        if (!manualDate) selectedAt = System.currentTimeMillis();
+        refreshUi(false);
     }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString(STATE_ELISA, elisaInput == null ? "" : elisaInput.getText().toString());
+        state.putString(STATE_LUCAS, lucasInput == null ? "" : lucasInput.getText().toString());
+        state.putLong(STATE_SELECTED, selectedAt);
+        state.putBoolean(STATE_MANUAL, manualDate);
+        state.putInt(STATE_HISTORY, historyDays);
+    }
+
+    private void restoreState(Bundle state) {
+        restoredElisa = state.getString(STATE_ELISA, "");
+        restoredLucas = state.getString(STATE_LUCAS, "");
+        selectedAt = state.getLong(STATE_SELECTED, selectedAt);
+        manualDate = state.getBoolean(STATE_MANUAL, false);
+        historyDays = state.getInt(STATE_HISTORY, HISTORY_FIRST_DAYS);
+    }
+
+    /** Cores da barra de status e de navegação; a API 30+ descontinuou estas chamadas. */
+    @SuppressWarnings("deprecation")
+    private void applySystemBars() {
+        Window window = getWindow();
+        window.setStatusBarColor(palette.background);
+        window.setNavigationBarColor(palette.background);
+        View decor = window.getDecorView();
+        int flags = decor.getSystemUiVisibility();
+        if (palette.dark) {
+            flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        } else {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        decor.setSystemUiVisibility(flags);
+    }
+
+    // ------------------------------------------------------------------ tela
 
     private void buildScreen() {
         ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(BACKGROUND);
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(20), dp(24), dp(20), dp(30));
-        scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
+        scroll.setBackgroundColor(palette.background);
+        scroll.setFillViewport(true);
+        root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(16), dp(20), dp(16), dp(28));
+        scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
 
-        content.addView(buildHeader(), lp(-1, -2, 0));
-        content.addView(buildIntroCard(), lp(-1, -2, 18));
-        content.addView(label("NOVA MARCAÇÃO", 12, GREEN, true), lp(-1, -2, 24));
-        content.addView(buildEntryCard(), lp(-1, -2, 24));
+        root.addView(buildHeader(), lp(-1, -2, 0));
+        noticeCard = card();
+        noticeText = label("", 14, palette.ink, false);
+        noticeCard.addView(noticeText);
+        Button ok = button("OK", palette.field, palette.ink, true);
+        ok.setOnClickListener(v -> {
+            notice = null;
+            refreshUi(false);
+        });
+        noticeCard.addView(ok, lp(-2, dp(48), 8));
+        root.addView(noticeCard, lp(-1, -2, 16));
 
-        LinearLayout statsHeader = new LinearLayout(this);
-        statsHeader.setGravity(Gravity.CENTER_VERTICAL);
-        TextView statsTitle = label("Variação desde a base", 21, INK, true);
-        statsHeader.addView(statsTitle, new LinearLayout.LayoutParams(0, -2, 1f));
-        TextView statsHint = label("kgf", 13, MUTED, false);
-        statsHeader.addView(statsHint);
-        content.addView(statsHeader, lp(-1, -2, 12));
+        emptyCard = card();
+        TextView eyebrow = label("DIÁRIO DO CASAL", 11, palette.gold, true);
+        eyebrow.setLetterSpacing(.12f);
+        emptyCard.addView(eyebrow);
+        emptyCard.addView(label("Como vocês estão evoluindo?", 20, palette.ink, true), lp(-1, -2, 5));
+        emptyCard.addView(label("Registre os dois pesos juntos e acompanhe a história em um só lugar.\n"
+                + "Tudo fica salvo apenas neste celular.", 14, palette.muted, false), lp(-1, -2, 5));
+        root.addView(emptyCard, lp(-1, -2, 16));
 
-        LinearLayout statsRow = new LinearLayout(this);
-        statsRow.setOrientation(LinearLayout.HORIZONTAL);
-        statsRow.setGravity(Gravity.TOP);
-        statsRow.addView(buildStatsCard("ELISA", CORAL, true), new LinearLayout.LayoutParams(0, -2, 1f));
-        statsRow.addView(space(10, 1));
-        statsRow.addView(buildStatsCard("LUCAS", GREEN, false), new LinearLayout.LayoutParams(0, -2, 1f));
-        content.addView(statsRow, lp(-1, -2, 24));
+        root.addView(sectionTitle("Nova marcação"), lp(-1, -2, 22));
+        root.addView(buildEntryCard(), lp(-1, -2, 8));
 
-        TextView chartTitle = label("Evolução no tempo", 21, INK, true);
-        content.addView(chartTitle, lp(-1, -2, 12));
-        content.addView(buildChartCard(), lp(-1, dp(326), 24));
+        root.addView(sectionTitle("Resumo"), lp(-1, -2, 22));
+        LinearLayout summary = new LinearLayout(this);
+        summary.setOrientation(LinearLayout.HORIZONTAL);
+        summary.addView(buildPersonCard(Diary.ELISA), new LinearLayout.LayoutParams(0, -2, 1f));
+        summary.addView(space(10, 1));
+        summary.addView(buildPersonCard(Diary.LUCAS), new LinearLayout.LayoutParams(0, -2, 1f));
+        root.addView(summary, lp(-1, -2, 8));
+        togetherCard = buildTogetherCard();
+        root.addView(togetherCard, lp(-1, -2, 10));
 
-        TextView historyTitle = label("Últimas marcações", 21, INK, true);
-        content.addView(historyTitle, lp(-1, -2, 12));
+        root.addView(sectionTitle("Evolução"), lp(-1, -2, 22));
+        root.addView(buildChartCard(), lp(-1, -2, 8));
+
+        root.addView(sectionTitle("Histórico"), lp(-1, -2, 22));
         historyContainer = new LinearLayout(this);
         historyContainer.setOrientation(LinearLayout.VERTICAL);
-        content.addView(historyContainer, lp(-1, -2, 0));
+        root.addView(historyContainer, lp(-1, -2, 8));
+        showMore = button("Mostrar mais", palette.field, palette.ink, false);
+        showMore.setOnClickListener(v -> {
+            historyDays += HISTORY_STEP_DAYS;
+            refreshUi(false);
+        });
+        root.addView(showMore, lp(-1, dp(48), 10));
+
+        footer = label("", 12, palette.muted, false);
+        footer.setGravity(Gravity.CENTER);
+        root.addView(footer, lp(-1, -2, 24));
 
         setContentView(scroll);
-        refreshUi();
+        if (restoredElisa != null) elisaInput.setText(restoredElisa);
+        if (restoredLucas != null) lucasInput.setText(restoredLucas);
     }
 
     private View buildHeader() {
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
 
-        TextView logo = label("↗", 26, Color.WHITE, true);
+        TextView logo = label("↗", 24, palette.onPrimary, true);
         logo.setGravity(Gravity.CENTER);
-        logo.setBackground(round(GREEN, 18));
+        logo.setBackground(round(palette.primary, 16));
         header.addView(logo, new LinearLayout.LayoutParams(dp(46), dp(46)));
 
         LinearLayout titleBox = new LinearLayout(this);
         titleBox.setOrientation(LinearLayout.VERTICAL);
         titleBox.setPadding(dp(12), 0, 0, 0);
-        TextView title = label("Peso a dois", 25, INK, true);
-        TextView subtitle = label("um registro de cada vez", 13, MUTED, false);
-        titleBox.addView(title);
-        titleBox.addView(subtitle, lp(-1, -2, 1));
+        titleBox.addView(label("Peso a dois", 24, palette.ink, true));
+        subtitle = label("", 13, palette.muted, false);
+        titleBox.addView(subtitle);
         header.addView(titleBox, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        TextView gear = label("⚙", 25, MUTED, false);
-        gear.setGravity(Gravity.CENTER);
-        gear.setContentDescription("Configurar bases de comparação");
-        gear.setOnClickListener(v -> openAboutBases());
-        header.addView(gear, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView menu = label("⋮", 24, palette.muted, true);
+        menu.setGravity(Gravity.CENTER);
+        menu.setContentDescription("Mais opções");
+        menu.setOnClickListener(this::showMenu);
+        header.addView(menu, new LinearLayout.LayoutParams(dp(48), dp(48)));
         return header;
     }
 
-    private View buildIntroCard() {
-        LinearLayout card = card();
-        TextView eyebrow = label("DIÁRIO DO CASAL", 11, GOLD, true);
-        eyebrow.setLetterSpacing(.12f);
-        card.addView(eyebrow);
-        TextView title = label("Como vocês estão evoluindo?", 20, INK, true);
-        card.addView(title, lp(-1, -2, 5));
-        TextView body = label("Registre os dois pesos juntos e acompanhe a história em um só lugar.\nTudo fica salvo apenas neste celular.", 14, MUTED, false);
-        body.setLineSpacing(dp(2), 1f);
-        card.addView(body, lp(-1, -2, 5));
-        return card;
+    private void showMenu(View anchor) {
+        PopupMenu popup = new PopupMenu(this, anchor);
+        popup.getMenu().add(0, 1, 0, "Sobre");
+        popup.setOnMenuItemClickListener(item -> {
+            if (item.getItemId() == 1) showAbout();
+            return true;
+        });
+        popup.show();
+    }
+
+    private View sectionTitle(String text) {
+        TextView title = label(text, 19, palette.ink, true);
+        return title;
     }
 
     private View buildEntryCard() {
         LinearLayout card = card();
-        TextView prompt = label("Pesos de hoje", 17, INK, true);
-        card.addView(prompt);
+        card.addView(label("Pesos da pesagem", 17, palette.ink, true));
+
+        LinearLayout dateRow = new LinearLayout(this);
+        dateRow.setGravity(Gravity.CENTER_VERTICAL);
+        dateText = label("", 14, palette.ink, false);
+        dateText.setGravity(Gravity.CENTER_VERTICAL);
+        dateText.setPadding(dp(14), 0, dp(14), 0);
+        dateText.setBackground(round(palette.field, 12));
+        dateText.setContentDescription("Escolher data da marcação");
+        dateText.setOnClickListener(v -> openDatePicker());
+        dateRow.addView(dateText, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        todayButton = button("Hoje", palette.field, palette.ink, true);
+        todayButton.setContentDescription("Voltar para hoje");
+        todayButton.setOnClickListener(v -> {
+            manualDate = false;
+            selectedAt = System.currentTimeMillis();
+            refreshUi(false);
+        });
+        dateRow.addView(todayButton, lp(-2, dp(48), 0));
+        card.addView(dateRow, lp(-1, -2, 12));
 
         LinearLayout fields = new LinearLayout(this);
-        fields.setOrientation(LinearLayout.HORIZONTAL);
         fields.setGravity(Gravity.TOP);
-        fields.addView(personField("ELISA", "peso dela", CORAL, CORAL_LIGHT, true), new LinearLayout.LayoutParams(0, -2, 1f));
+        elisaName = new TextView(this);
+        elisaInput = new EditText(this);
+        elisaLast = new TextView(this);
+        fields.addView(personInput(Diary.ELISA, elisaName, elisaInput, elisaLast),
+                new LinearLayout.LayoutParams(0, -2, 1f));
         fields.addView(space(10, 1));
-        fields.addView(personField("LUCAS", "seu peso", GREEN, GREEN_LIGHT, false), new LinearLayout.LayoutParams(0, -2, 1f));
-        card.addView(fields, lp(-1, -2, 17));
+        lucasName = new TextView(this);
+        lucasInput = new EditText(this);
+        lucasLast = new TextView(this);
+        fields.addView(personInput(Diary.LUCAS, lucasName, lucasInput, lucasLast),
+                new LinearLayout.LayoutParams(0, -2, 1f));
+        card.addView(fields, lp(-1, -2, 14));
 
-        chosenDate = label("📅  " + fullDate(selectedAt), 14, INK, false);
-        chosenDate.setGravity(Gravity.CENTER_VERTICAL);
-        chosenDate.setPadding(dp(14), 0, dp(14), 0);
-        chosenDate.setBackground(round(Color.rgb(246, 249, 246), 12));
-        chosenDate.setOnClickListener(v -> openDatePicker());
-        chosenDate.setContentDescription("Escolher data da marcação");
-        card.addView(chosenDate, lp(-1, dp(48), 0));
+        Button register = button("Registrar", palette.primary, palette.onPrimary, true);
+        register.setOnClickListener(v -> onRegister());
+        card.addView(register, lp(-1, dp(52), 4));
 
-        Button save = button("Registrar pesagens", GREEN, Color.WHITE, true);
-        save.setOnClickListener(v -> saveMeasurements());
-        card.addView(save, lp(-1, dp(52), 12));
-        saveStatus = label("A data fica automaticamente como hoje.", 12, MUTED, false);
-        card.addView(saveStatus, lp(-1, -2, 0));
+        saveStatus = label("A data fica automaticamente como hoje.", 12, palette.muted, false);
+        card.addView(saveStatus, lp(-1, -2, 8));
         return card;
     }
 
-    private View personField(String name, String hint, int accent, int tint, boolean elisa) {
+    private LinearLayout personInput(String person, TextView nameView, EditText input, TextView lastView) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        TextView nameView = label(name, 12, accent, true);
+        nameView.setTextSize(12);
+        nameView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        nameView.setTextColor(palette.accent(person));
         nameView.setLetterSpacing(.10f);
         box.addView(nameView);
-        TextView hintView = label(hint, 11, MUTED, false);
-        box.addView(hintView, lp(-1, -2, 3));
 
-        EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setTextSize(18);
-        input.setTextColor(INK);
-        input.setHintTextColor(Color.rgb(167, 181, 171));
+        input.setTextColor(palette.ink);
+        input.setHintTextColor(palette.muted);
         input.setHint("ex. 68,5");
-        input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        input.setKeyListener(DigitsKeyListener.getInstance("0123456789,."));
+        input.setRawInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         input.setPadding(dp(13), 0, dp(10), 0);
-        input.setBackground(stroked(tint, BORDER, 12, 1));
-        input.setContentDescription("Peso de " + (elisa ? "Elisa" : "Lucas") + " em kgf");
-        if (elisa) elisaInput = input; else lucasInput = input;
-        box.addView(input, lp(-1, dp(54), 7));
+        input.setBackground(stroked(palette.field, palette.border, 12, 1));
+        input.setContentDescription("Peso de " + diary.person(person).name + " em kgf");
+        if (Diary.ELISA.equals(person)) {
+            input.setImeOptions(EditorInfo.IME_ACTION_NEXT);
+        } else {
+            input.setImeOptions(EditorInfo.IME_ACTION_DONE);
+            input.setOnEditorActionListener((v, actionId, event) -> {
+                if (actionId != EditorInfo.IME_ACTION_DONE) return false;
+                onRegister();
+                return true;
+            });
+        }
+        box.addView(input, lp(-1, dp(54), 6));
 
-        TextView unit = label("kgf", 12, MUTED, false);
-        unit.setGravity(Gravity.RIGHT);
-        box.addView(unit);
+        box.addView(label("kgf", 12, palette.muted, false));
+        lastView.setTextSize(11);
+        lastView.setTextColor(palette.muted);
+        box.addView(lastView, lp(-1, -2, 4));
         return box;
     }
 
-    private View buildStatsCard(String person, int accent, boolean elisa) {
+    private LinearLayout buildPersonCard(String person) {
         LinearLayout box = card();
+        box.setClickable(true);
+        box.setOnClickListener(v -> showPersonDialog(person));
+        PersonCard holder = new PersonCard();
+
         LinearLayout top = new LinearLayout(this);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        TextView name = label(person, 12, accent, true);
-        name.setLetterSpacing(.10f);
-        top.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
-        TextView gear = label("⚙", 18, MUTED, false);
+        holder.name = label("", 12, palette.accent(person), true);
+        holder.name.setLetterSpacing(.10f);
+        top.addView(holder.name, new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView gear = label("⚙", 18, palette.muted, false);
         gear.setGravity(Gravity.CENTER);
-        gear.setContentDescription("Configurar base de " + person);
-        final boolean personIsElisa = elisa;
-        gear.setOnClickListener(v -> openBaseDialog(personIsElisa));
-        top.addView(gear, new LinearLayout.LayoutParams(dp(32), dp(30)));
+        gear.setContentDescription("Configurar " + diary.person(person).name);
+        gear.setOnClickListener(v -> showPersonDialog(person));
+        top.addView(gear, new LinearLayout.LayoutParams(dp(48), dp(48)));
         box.addView(top);
 
-        TextView current = label("—", 23, INK, true);
-        box.addView(current, lp(-1, -2, 9));
-        TextView delta = label("Sem marcações", 13, MUTED, true);
-        box.addView(delta, lp(-1, -2, 4));
-        TextView percent = label("—", 13, MUTED, false);
-        box.addView(percent, lp(-1, -2, 2));
-        TextView base = label("Base: primeira marcação", 10, MUTED, false);
-        box.addView(base, lp(-1, -2, 8));
+        holder.current = label("—", 24, palette.ink, true);
+        box.addView(holder.current, lp(-1, -2, 4));
+        holder.ago = label("Sem marcações", 13, palette.muted, false);
+        box.addView(holder.ago, lp(-1, -2, 2));
+        holder.change = label("", 13, palette.ink, true);
+        box.addView(holder.change, lp(-1, -2, 8));
+        holder.base = label("", 11, palette.muted, false);
+        box.addView(holder.base, lp(-1, -2, 4));
+        holder.goalText = label("", 12, palette.muted, false);
+        box.addView(holder.goalText, lp(-1, -2, 8));
+        holder.goalBar = new LinearLayout(this);
+        holder.goalBar.setOrientation(LinearLayout.HORIZONTAL);
+        holder.goalBar.setWeightSum(1f);
+        holder.goalBar.setBackground(round(palette.field, 3));
+        box.addView(holder.goalBar, lp(-1, dp(6), 6));
 
-        if (elisa) {
-            elisaCurrent = current;
-            elisaDelta = delta;
-            elisaPercent = percent;
-            elisaBase = base;
-        } else {
-            lucasCurrent = current;
-            lucasDelta = delta;
-            lucasPercent = percent;
-            lucasBase = base;
-        }
+        cards.put(person, holder);
         return box;
     }
 
-    private View buildChartCard() {
+    private LinearLayout buildTogetherCard() {
+        LinearLayout box = card();
+        togetherSince = label("", 14, palette.ink, true);
+        box.addView(togetherSince);
+        togetherPercent = label("", 13, palette.muted, false);
+        box.addView(togetherPercent, lp(-1, -2, 6));
+        togetherRecent = label("", 13, palette.muted, false);
+        box.addView(togetherRecent, lp(-1, -2, 4));
+        return box;
+    }
+
+    private LinearLayout buildChartCard() {
         LinearLayout box = card();
         LinearLayout legend = new LinearLayout(this);
         legend.setGravity(Gravity.CENTER_VERTICAL);
-        legend.addView(dot(CORAL), new LinearLayout.LayoutParams(dp(9), dp(9)));
-        legend.addView(label(" Elisa", 12, MUTED, false), lp(-2, -2, 4));
+        legend.addView(dot(palette.accentElisa), new LinearLayout.LayoutParams(dp(9), dp(9)));
+        legendElisa = label("", 12, palette.muted, false);
+        legend.addView(legendElisa, lp(-2, -2, 4));
         legend.addView(space(16, 1));
-        legend.addView(dot(GREEN), new LinearLayout.LayoutParams(dp(9), dp(9)));
-        legend.addView(label(" Lucas", 12, MUTED, false), lp(-2, -2, 4));
+        legend.addView(dot(palette.accentLucas), new LinearLayout.LayoutParams(dp(9), dp(9)));
+        legendLucas = label("", 12, palette.muted, false);
+        legend.addView(legendLucas, lp(-2, -2, 4));
         box.addView(legend);
-        chart = new WeightChart(this);
+
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        modeChips = new TextView[2];
+        modeChips[0] = chip("kgf", "Mostrar em quilos");
+        modeChips[1] = chip("%", "Mostrar variação em porcentagem desde a base");
+        modeChips[0].setOnClickListener(v -> setChartMode(false));
+        modeChips[1].setOnClickListener(v -> setChartMode(true));
+        modeRow.addView(modeChips[0], lp(-2, dp(48), 0));
+        modeRow.addView(modeChips[1], lp(-2, dp(48), 0));
+        box.addView(modeRow, lp(-1, -2, 10));
+
+        LinearLayout rangeRow = new LinearLayout(this);
+        rangeRow.setOrientation(LinearLayout.HORIZONTAL);
+        rangeChips = new TextView[RANGE_DAYS.length];
+        for (int i = 0; i < RANGE_DAYS.length; i++) {
+            final int days = RANGE_DAYS[i];
+            rangeChips[i] = chip(RANGE_LABELS[i], "Período: " + RANGE_LABELS[i]);
+            rangeChips[i].setOnClickListener(v -> setChartRange(days));
+            rangeRow.addView(rangeChips[i], lp(-2, dp(48), 0));
+        }
+        box.addView(rangeRow, lp(-1, -2, 2));
+
+        chart = new WeightChart(this, palette);
         box.addView(chart, lp(-1, dp(250), 8));
         return box;
     }
 
-    private void refreshUi() {
-        ArrayList<WeightPoint> elisa = readPoints("elisa");
-        ArrayList<WeightPoint> lucas = readPoints("lucas");
-        updateStats(elisa, true);
-        updateStats(lucas, false);
-        chart.setData(elisa, lucas);
-        updateHistory(elisa, lucas);
-        if (chosenDate != null) chosenDate.setText("📅  " + fullDate(selectedAt));
+    private TextView chip(String text, String description) {
+        TextView chip = label(text, 13, palette.muted, true);
+        chip.setGravity(Gravity.CENTER);
+        chip.setMinHeight(dp(48));
+        chip.setMinWidth(dp(48));
+        chip.setPadding(dp(12), 0, dp(12), 0);
+        chip.setContentDescription(description);
+        return chip;
     }
 
-    private void updateStats(ArrayList<WeightPoint> points, boolean isElisa) {
-        TextView current = isElisa ? elisaCurrent : lucasCurrent;
-        TextView delta = isElisa ? elisaDelta : lucasDelta;
-        TextView percent = isElisa ? elisaPercent : lucasPercent;
-        TextView baseText = isElisa ? elisaBase : lucasBase;
-        if (points.isEmpty()) {
-            current.setText("—");
-            delta.setText("Sem marcações");
-            percent.setText("—");
-            baseText.setText("Base: primeira marcação");
+    private void setChartMode(boolean percent) {
+        chartPercent = percent;
+        ui.edit().putBoolean(KEY_CHART_PERCENT, percent).apply();
+        refreshUi(true);
+    }
+
+    private void setChartRange(int days) {
+        chartRange = days;
+        ui.edit().putInt(KEY_CHART_RANGE, days).apply();
+        refreshUi(true);
+    }
+
+    // ------------------------------------------------------------------ atualização
+
+    private void refreshUi(boolean withChart) {
+        if (root == null) return;
+        long now = System.currentTimeMillis();
+
+        subtitle.setText(subtitleText());
+        noticeCard.setVisibility(notice != null ? View.VISIBLE : View.GONE);
+        if (notice != null) noticeText.setText(notice);
+        emptyCard.setVisibility(diary.isEmpty() ? View.VISIBLE : View.GONE);
+        dateText.setText(manualDate ? "📅  " + DateText.fullDate(selectedAt)
+                : "📅  Hoje · " + DateText.fullDate(now));
+        todayButton.setVisibility(manualDate ? View.VISIBLE : View.GONE);
+
+        elisaName.setText(diary.person(Diary.ELISA).name.toUpperCase(PT_BR));
+        lucasName.setText(diary.person(Diary.LUCAS).name.toUpperCase(PT_BR));
+        elisaLast.setText(lastHint(Diary.ELISA, now));
+        lucasLast.setText(lastHint(Diary.LUCAS, now));
+        legendElisa.setText(diary.person(Diary.ELISA).name);
+        legendLucas.setText(diary.person(Diary.LUCAS).name);
+
+        for (String person : Diary.PEOPLE) refreshPersonCard(person, now);
+        refreshTogether(now);
+        if (withChart) chart.setData(diary, chartRange, chartPercent, now);
+        refreshChips();
+        refreshHistory(now);
+        footer.setText("Dados salvos só neste aparelho · versão " + versionName());
+    }
+
+    private String subtitleText() {
+        if (diary.isEmpty()) return "um registro de cada vez";
+        long first = Long.MAX_VALUE;
+        for (Entry entry : diary.all()) first = Math.min(first, entry.at);
+        int count = diary.size();
+        return count + (count == 1 ? " marcação desde " : " marcações desde ") + DateText.monthYear(first);
+    }
+
+    private String lastHint(String person, long now) {
+        Entry latest = diary.latest(person);
+        if (latest == null) return "primeira marcação";
+        return "último: " + WeightFormat.format(latest.kg) + " · " + DateText.relative(latest.at, now);
+    }
+
+    private void refreshPersonCard(String person, long now) {
+        PersonCard card = cards.get(person);
+        if (card == null) return;
+        PersonInfo info = diary.person(person);
+        card.name.setText(info.name.toUpperCase(PT_BR));
+        Entry latest = diary.latest(person);
+        if (latest == null) {
+            card.current.setText("—");
+            card.ago.setText("Sem marcações");
+            card.change.setText("");
+            card.base.setText("");
+            card.goalText.setVisibility(View.GONE);
+            card.goalBar.setVisibility(View.GONE);
             return;
         }
-        WeightPoint latest = points.get(points.size() - 1);
-        WeightPoint base = comparisonBase(isElisa, points);
-        current.setText(formatWeight(latest.value) + " kgf");
-        double change = latest.value - base.value;
-        String direction = change >= 0 ? "Ganho " : "Perda ";
-        delta.setText(direction + formatWeight(Math.abs(change)) + " kgf");
-        double pct = base.value == 0 ? 0 : (change / base.value) * 100.0;
-        percent.setText((pct >= 0 ? "+" : "−") + formatWeight(Math.abs(pct)) + "%");
-        boolean custom = prefs().getBoolean(KEY_BASE_CUSTOM + (isElisa ? "elisa" : "lucas"), false);
-        baseText.setText(custom ? "Base: " + formatWeight(base.value) + " kgf · " + shortDate(base.at)
-                : "Base: primeira marcação · " + shortDate(base.at));
+        card.current.setText(WeightFormat.format(latest.kg) + " kgf");
+        card.ago.setText(DateText.relative(latest.at, now));
+        Double change = Stats.changeSinceBase(diary, person);
+        Double percent = Stats.percentSinceBase(diary, person);
+        StringBuilder changeText = new StringBuilder();
+        if (change != null) changeText.append(WeightFormat.formatSigned(change)).append(" kgf");
+        if (percent != null) changeText.append(" · ").append(WeightFormat.formatPercent(percent));
+        card.change.setText(changeText.toString());
+
+        Diary.Base base = diary.base(person);
+        if (base.custom) {
+            card.base.setText("Base " + WeightFormat.format(base.kg) + " kgf · " + DateText.shortDate(base.at));
+        } else {
+            card.base.setText("Base: primeira marcação · " + DateText.shortDate(base.at));
+        }
+
+        if (info.hasGoal()) {
+            Stats.GoalStatus goal = Stats.goal(base.kg, latest.kg, info.goalKg);
+            card.goalText.setVisibility(View.VISIBLE);
+            card.goalBar.setVisibility(View.VISIBLE);
+            card.goalText.setText(goal.reached
+                    ? "Meta alcançada 🎉"
+                    : "Meta " + WeightFormat.format(info.goalKg) + " · faltam "
+                    + WeightFormat.format(goal.remainingKg) + " kgf");
+            card.goalBar.removeAllViews();
+            float done = (float) goal.progress;
+            if (done > 0) {
+                View fill = new View(this);
+                fill.setBackground(round(palette.accent(person), 3));
+                card.goalBar.addView(fill, new LinearLayout.LayoutParams(0, -1, done));
+            }
+            if (done < 1f) {
+                card.goalBar.addView(new View(this), new LinearLayout.LayoutParams(0, -1, 1f - done));
+            }
+        } else {
+            card.goalText.setVisibility(View.GONE);
+            card.goalBar.setVisibility(View.GONE);
+        }
     }
 
-    private void updateHistory(ArrayList<WeightPoint> elisa, ArrayList<WeightPoint> lucas) {
-        if (historyContainer == null) return;
+    private void refreshTogether(long now) {
+        boolean both = diary.latest(Diary.ELISA) != null && diary.latest(Diary.LUCAS) != null;
+        togetherCard.setVisibility(both ? View.VISIBLE : View.GONE);
+        if (!both) return;
+        Double elisaChange = Stats.changeSinceBase(diary, Diary.ELISA);
+        Double lucasChange = Stats.changeSinceBase(diary, Diary.LUCAS);
+        Double elisaPercent = Stats.percentSinceBase(diary, Diary.ELISA);
+        Double lucasPercent = Stats.percentSinceBase(diary, Diary.LUCAS);
+        togetherSince.setText("Juntos desde as bases: "
+                + WeightFormat.formatSigned(elisaChange + lucasChange) + " kgf");
+        togetherPercent.setText("Em %: " + diary.person(Diary.ELISA).name + " "
+                + (elisaPercent == null ? "—" : WeightFormat.formatPercent(elisaPercent))
+                + " · " + diary.person(Diary.LUCAS).name + " "
+                + (lucasPercent == null ? "—" : WeightFormat.formatPercent(lucasPercent)));
+        togetherRecent.setText("Últimos 30 dias: " + diary.person(Diary.ELISA).name + " "
+                + recentChange(Diary.ELISA) + " · " + diary.person(Diary.LUCAS).name + " "
+                + recentChange(Diary.LUCAS) + " kgf");
+    }
+
+    private String recentChange(String person) {
+        Double change = Stats.changeOverDays(diary.of(person), 30);
+        return change == null ? "—" : WeightFormat.formatSigned(change);
+    }
+
+    private void refreshChips() {
+        for (int i = 0; i < modeChips.length; i++) styleChip(modeChips[i], (i == 1) == chartPercent);
+        for (int i = 0; i < rangeChips.length; i++) styleChip(rangeChips[i], RANGE_DAYS[i] == chartRange);
+    }
+
+    private void styleChip(TextView chip, boolean selected) {
+        chip.setSelected(selected);
+        chip.setTextColor(selected ? palette.onPrimary : palette.muted);
+        GradientDrawable pill = round(selected ? palette.primary : palette.field, 16);
+        Drawable inset = new InsetDrawable(pill, 0, dp(12), 0, dp(12));
+        chip.setBackground(inset);
+    }
+
+    // ------------------------------------------------------------------ histórico
+
+    private void refreshHistory(long now) {
         historyContainer.removeAllViews();
-        ArrayList<HistoryRow> rows = new ArrayList<>();
-        for (WeightPoint point : elisa) rows.add(new HistoryRow(point.at, point.value, Double.NaN));
-        for (WeightPoint point : lucas) rows.add(new HistoryRow(point.at, Double.NaN, point.value));
-        Collections.sort(rows, (a, b) -> Long.compare(b.at, a.at));
-        if (rows.isEmpty()) {
+        if (diary.isEmpty()) {
             LinearLayout empty = card();
-            empty.addView(label("Ainda não há marcações. O primeiro registro aparece aqui.", 13, MUTED, false));
+            empty.addView(label("Ainda não há marcações. O primeiro registro aparece aqui.", 13,
+                    palette.muted, false));
             historyContainer.addView(empty, lp(-1, -2, 0));
+            showMore.setVisibility(View.GONE);
             return;
         }
-        int limit = Math.min(12, rows.size());
-        for (int i = 0; i < limit; i++) {
-            HistoryRow row = rows.get(i);
-            LinearLayout item = new LinearLayout(this);
-            item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(dp(14), dp(10), dp(14), dp(10));
-            item.setBackground(round(SURFACE, 12));
-            TextView date = label(shortDateTime(row.at), 12, MUTED, false);
-            item.addView(date, new LinearLayout.LayoutParams(0, -2, 1f));
-            if (!Double.isNaN(row.elisa)) {
-                TextView value = label("Elisa  " + formatWeight(row.elisa), 13, CORAL, true);
-                item.addView(value, lp(-2, -2, 8));
+        Map<String, List<Entry>> byPerson = new HashMap<>();
+        for (String person : Diary.PEOPLE) byPerson.put(person, diary.of(person));
+
+        List<Entry> all = diary.all();
+        ArrayList<LocalDate> days = new ArrayList<>();
+        ArrayList<Long> sampleAt = new ArrayList<>();
+        for (int i = all.size() - 1; i >= 0; i--) {
+            LocalDate day = DateText.day(all.get(i).at);
+            if (days.isEmpty() || !days.get(days.size() - 1).equals(day)) {
+                days.add(day);
+                sampleAt.add(all.get(i).at);
             }
-            if (!Double.isNaN(row.lucas)) {
-                TextView value = label("Lucas  " + formatWeight(row.lucas), 13, GREEN, true);
-                item.addView(value, lp(-2, -2, 8));
-            }
-            historyContainer.addView(item, lp(-1, -2, i == limit - 1 ? 0 : 6));
         }
+        LocalDate windowStart = DateText.day(now).minusDays(historyDays - 1);
+        boolean olderHidden = false;
+        int shown = 0;
+        for (int i = 0; i < days.size(); i++) {
+            if (days.get(i).isBefore(windowStart)) {
+                olderHidden = true;
+                break;
+            }
+            historyContainer.addView(buildDayRow(days.get(i), sampleAt.get(i), now, byPerson),
+                    lp(-1, -2, shown == 0 ? 0 : 6));
+            shown++;
+        }
+        showMore.setVisibility(olderHidden ? View.VISIBLE : View.GONE);
     }
 
-    private void saveMeasurements() {
-        Double elisa = parseWeight(elisaInput);
-        Double lucas = parseWeight(lucasInput);
-        if (elisa == null && hasText(elisaInput) || lucas == null && hasText(lucasInput)) {
-            Toast.makeText(this, "Digite um peso válido entre 1 e 500 kgf.", Toast.LENGTH_SHORT).show();
+    private View buildDayRow(LocalDate day, long sample, long now, Map<String, List<Entry>> byPerson) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(8), dp(12), dp(8));
+        row.setBackground(stroked(palette.surface, palette.border, 12, 1));
+        TextView label = label(DateText.dayLabel(sample, now), 13, palette.ink, true);
+        row.addView(label, new LinearLayout.LayoutParams(dp(92), -2));
+        for (String person : Diary.PEOPLE) {
+            row.addView(buildCell(person, day, byPerson.get(person), now),
+                    new LinearLayout.LayoutParams(0, -2, 1f));
+        }
+        return row;
+    }
+
+    private View buildCell(String person, LocalDate day, List<Entry> entries, long now) {
+        LinearLayout cell = new LinearLayout(this);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER_VERTICAL);
+        cell.setMinimumHeight(dp(48));
+        cell.setPadding(dp(6), dp(4), dp(6), dp(4));
+        cell.setClickable(true);
+        String name = diary.person(person).name;
+
+        Entry last = null;
+        int lastIndex = -1;
+        int count = 0;
+        for (int i = 0; i < entries.size(); i++) {
+            if (DateText.day(entries.get(i).at).equals(day)) {
+                count++;
+                last = entries.get(i);
+                lastIndex = i;
+            }
+        }
+        if (last == null) {
+            cell.addView(label("—", 15, palette.muted, false));
+            cell.setContentDescription(name + ", sem marcação neste dia.");
+            return cell;
+        }
+        LinearLayout valueLine = new LinearLayout(this);
+        valueLine.setGravity(Gravity.CENTER_VERTICAL);
+        valueLine.addView(label(WeightFormat.format(last.kg), 16, palette.accent(person), true));
+        if (count > 1) {
+            TextView extra = label(" +" + (count - 1), 11, palette.muted, true);
+            valueLine.addView(extra);
+        }
+        cell.addView(valueLine);
+        if (lastIndex > 0) {
+            double delta = last.kg - entries.get(lastIndex - 1).kg;
+            cell.addView(label(WeightFormat.formatSigned(delta), 11, palette.muted, false));
+        }
+        cell.setContentDescription(name + ", " + WeightFormat.format(last.kg) + " kgf, "
+                + DateText.fullDate(last.at) + ". Toque para editar.");
+        cell.setOnClickListener(v -> onHistoryCell(person, day));
+        return cell;
+    }
+
+    private void onHistoryCell(String person, LocalDate day) {
+        final List<Entry> same = new ArrayList<>();
+        for (Entry entry : diary.of(person)) {
+            if (DateText.day(entry.at).equals(day)) same.add(entry);
+        }
+        if (same.isEmpty()) return;
+        if (same.size() == 1) {
+            showEditDialog(same.get(0));
             return;
         }
-        if (elisa == null && lucas == null) {
-            Toast.makeText(this, "Preencha pelo menos um dos pesos.", Toast.LENGTH_SHORT).show();
+        String[] labels = new String[same.size()];
+        for (int i = 0; i < labels.length; i++) {
+            labels[i] = DateText.time(same.get(i).at) + " · " + WeightFormat.format(same.get(i).kg) + " kgf";
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(diary.person(person).name + " · " + DateText.shortDate(same.get(0).at))
+                .setItems(labels, (dialog, which) -> showEditDialog(same.get(which)))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    // ------------------------------------------------------------------ registro
+
+    private void onRegister() {
+        String elisaRaw = elisaInput.getText().toString();
+        String lucasRaw = lucasInput.getText().toString();
+        Double elisaKg = null;
+        Double lucasKg = null;
+        if (!WeightFormat.isBlank(elisaRaw)) {
+            elisaKg = WeightFormat.parse(elisaRaw);
+            if (elisaKg == null) {
+                elisaInput.setError(WEIGHT_ERROR);
+                elisaInput.requestFocus();
+                return;
+            }
+        }
+        if (!WeightFormat.isBlank(lucasRaw)) {
+            lucasKg = WeightFormat.parse(lucasRaw);
+            if (lucasKg == null) {
+                lucasInput.setError(WEIGHT_ERROR);
+                lucasInput.requestFocus();
+                return;
+            }
+        }
+        if (elisaKg == null && lucasKg == null) {
+            elisaInput.setError("Preencha pelo menos um dos pesos.");
+            elisaInput.requestFocus();
             return;
         }
-        long stamp = registrationTimestamp();
-        if (elisa != null) appendPoint("elisa", new WeightPoint(stamp, elisa));
-        if (lucas != null) appendPoint("lucas", new WeightPoint(stamp, lucas));
+        List<Pending> pending = new ArrayList<>();
+        if (elisaKg != null) pending.add(new Pending(Diary.ELISA, elisaKg));
+        if (lucasKg != null) pending.add(new Pending(Diary.LUCAS, lucasKg));
+        long stamp = registrationTime();
+        confirmBigChanges(pending, stamp);
+    }
+
+    /** Data escolhida (se manual) com a hora atual. */
+    private long registrationTime() {
+        long now = System.currentTimeMillis();
+        return manualDate ? DateText.combine(selectedAt, now) : now;
+    }
+
+    private void confirmBigChanges(List<Pending> pending, long stamp) {
+        StringBuilder message = new StringBuilder();
+        for (Pending item : pending) {
+            Entry last = diary.latest(item.person);
+            if (last != null && Math.abs(item.kg - last.kg) > BIG_CHANGE * last.kg) {
+                if (message.length() > 0) message.append(' ');
+                message.append(diary.person(item.person).name).append(' ')
+                        .append(WeightFormat.format(item.kg)).append(" kgf (último ")
+                        .append(WeightFormat.format(last.kg)).append(" kgf).");
+            }
+        }
+        if (message.length() == 0) {
+            confirmSameDay(pending, stamp);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Confira o valor")
+                .setMessage("Confira o valor: " + message)
+                .setPositiveButton("Salvar mesmo assim", (dialog, which) -> confirmSameDay(pending, stamp))
+                .setNegativeButton("Corrigir", (dialog, which) -> focusPerson(pending.get(0).person))
+                .show();
+    }
+
+    private void confirmSameDay(List<Pending> pending, long stamp) {
+        StringBuilder message = new StringBuilder();
+        boolean today = DateText.sameDay(stamp, System.currentTimeMillis());
+        for (Pending item : pending) {
+            List<Entry> same = diary.sameDay(item.person, stamp);
+            if (same.isEmpty()) continue;
+            Entry last = same.get(same.size() - 1);
+            if (message.length() > 0) message.append('\n');
+            message.append(diary.person(item.person).name).append(" já tem ")
+                    .append(WeightFormat.format(last.kg)).append(" kgf ")
+                    .append(today ? "hoje" : "em " + DateText.shortDate(stamp))
+                    .append(" (").append(DateText.time(last.at)).append(").");
+        }
+        if (message.length() == 0) {
+            saveMeasurements(pending, stamp, false);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Já há marcação")
+                .setMessage(message)
+                .setPositiveButton("Substituir", (dialog, which) -> saveMeasurements(pending, stamp, true))
+                .setNeutralButton("Manter as duas", (dialog, which) -> saveMeasurements(pending, stamp, false))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void saveMeasurements(List<Pending> pending, long stamp, boolean replace) {
+        Diary next = diary.copy();
+        for (Pending item : pending) {
+            if (replace) next.removeSameDay(item.person, stamp);
+            next.add(Entry.create(item.person, stamp, item.kg));
+        }
+        if (!commit(next)) return;
+        elisaInput.setError(null);
+        lucasInput.setError(null);
         elisaInput.setText("");
         lucasInput.setText("");
-        selectedAt = System.currentTimeMillis();
-        manuallySelectedDate = false;
-        saveStatus.setText("Salvo em " + shortDateTime(stamp) + ". Dados guardados neste celular.");
-        saveStatus.setTextColor(GREEN);
-        refreshUi();
-        Toast.makeText(this, "Pesagem registrada", Toast.LENGTH_SHORT).show();
+        hideKeyboard();
+        long now = System.currentTimeMillis();
+        if (!manualDate) selectedAt = now;
+        String when = DateText.sameDay(stamp, now) ? "" : " em " + DateText.shortDate(stamp);
+        saveStatus.setText("Salvo" + when + " às " + DateText.time(stamp) + " ✓");
+        saveStatus.setTextColor(palette.primary);
+        root.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        refreshUi(true);
+    }
+
+    /** Grava o diário novo; só troca o da memória se a gravação deu certo. */
+    private boolean commit(Diary next) {
+        if (store.save(next)) {
+            diary = next;
+            return true;
+        }
+        Toast.makeText(this, "Não foi possível salvar. Verifique o espaço livre.", Toast.LENGTH_LONG).show();
+        return false;
+    }
+
+    private void focusPerson(String person) {
+        EditText target = Diary.ELISA.equals(person) ? elisaInput : lucasInput;
+        target.requestFocus();
+    }
+
+    private void hideKeyboard() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null && root != null) imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
     }
 
     private void openDatePicker() {
         Calendar initial = Calendar.getInstance();
         initial.setTimeInMillis(selectedAt);
-        DatePickerDialog dialog = new DatePickerDialog(this,
-                (view, year, month, day) -> {
-                    Calendar chosen = Calendar.getInstance();
-                    chosen.setTimeInMillis(selectedAt);
-                    chosen.set(Calendar.YEAR, year);
-                    chosen.set(Calendar.MONTH, month);
-                    chosen.set(Calendar.DAY_OF_MONTH, day);
-                    selectedAt = chosen.getTimeInMillis();
-                    manuallySelectedDate = true;
-                    chosenDate.setText("📅  " + fullDate(selectedAt));
-                    saveStatus.setText("Data escolhida manualmente; toque para alterar.");
-                    saveStatus.setTextColor(MUTED);
-                }, initial.get(Calendar.YEAR), initial.get(Calendar.MONTH), initial.get(Calendar.DAY_OF_MONTH));
+        DatePickerDialog dialog = new DatePickerDialog(this, (view, year, month, day) -> {
+            selectedAt = DateText.withDate(selectedAt, year, month, day);
+            manualDate = true;
+            refreshUi(false);
+        }, initial.get(Calendar.YEAR), initial.get(Calendar.MONTH), initial.get(Calendar.DAY_OF_MONTH));
+        dialog.getDatePicker().setMaxDate(System.currentTimeMillis());
         dialog.show();
     }
 
-    private void openAboutBases() {
+    // ------------------------------------------------------------------ diálogos
+
+    private void showEditDialog(Entry entry) {
+        String name = diary.person(entry.person).name;
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(22), dp(4), dp(22), 0);
+
+        EditText weight = new EditText(this);
+        weight.setSingleLine(true);
+        weight.setTextSize(17);
+        weight.setTextColor(palette.ink);
+        weight.setHint("ex. 68,5");
+        weight.setKeyListener(DigitsKeyListener.getInstance("0123456789,."));
+        weight.setRawInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        weight.setText(WeightFormat.format(entry.kg));
+        weight.setPadding(dp(12), 0, dp(10), 0);
+        weight.setBackground(stroked(palette.field, palette.border, 10, 1));
+        weight.setContentDescription("Peso de " + name + " em kgf");
+        body.addView(weight, lp(-1, dp(50), 6));
+
+        final long[] chosen = {entry.at};
+        Button date = button("📅  " + DateText.fullDate(chosen[0]), palette.field, palette.ink, false);
+        body.addView(date, lp(-1, dp(48), 6));
+        date.setOnClickListener(v -> {
+            Calendar c = Calendar.getInstance();
+            c.setTimeInMillis(chosen[0]);
+            DatePickerDialog picker = new DatePickerDialog(this, (view, year, month, day) -> {
+                chosen[0] = DateText.withDate(chosen[0], year, month, day);
+                date.setText("📅  " + DateText.fullDate(chosen[0]));
+            }, c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH));
+            picker.getDatePicker().setMaxDate(System.currentTimeMillis());
+            picker.show();
+        });
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Editar marcação de " + name)
+                .setView(body)
+                .setPositiveButton("Salvar", null)
+                .setNeutralButton("Excluir", null)
+                .setNegativeButton("Cancelar", null)
+                .create();
+        dialog.setOnShowListener(d -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                Double kg = WeightFormat.parse(weight.getText().toString());
+                if (kg == null) {
+                    weight.setError(WEIGHT_ERROR);
+                    return;
+                }
+                Diary next = diary.copy();
+                if (next.update(entry.id, chosen[0], kg) && commit(next)) {
+                    dialog.dismiss();
+                    refreshUi(true);
+                }
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> confirmDelete(entry, dialog));
+        });
+        dialog.show();
+    }
+
+    private void confirmDelete(Entry entry, AlertDialog editDialog) {
+        String name = diary.person(entry.person).name;
         new AlertDialog.Builder(this)
-                .setTitle("Bases de comparação")
-                .setMessage("Por padrão, cada variação usa a primeira marcação de Elisa e de Lucas. Toque na engrenagem do cartão de cada pessoa para escolher outro peso e outra data.")
-                .setPositiveButton("Entendi", null)
+                .setMessage("Excluir a marcação de " + name + " de " + DateText.shortDate(entry.at)
+                        + " (" + WeightFormat.format(entry.kg) + " kgf)?")
+                .setPositiveButton("Excluir", (dialog, which) -> {
+                    Diary next = diary.copy();
+                    if (next.remove(entry.id) && commit(next)) {
+                        editDialog.dismiss();
+                        refreshUi(true);
+                    }
+                })
+                .setNegativeButton("Cancelar", null)
                 .show();
     }
 
-    private void openBaseDialog(final boolean isElisa) {
-        final String key = isElisa ? "elisa" : "lucas";
-        final String person = isElisa ? "Elisa" : "Lucas";
-        final ArrayList<WeightPoint> points = readPoints(key);
-        final boolean custom = prefs().getBoolean(KEY_BASE_CUSTOM + key, false);
-        WeightPoint first = points.isEmpty() ? new WeightPoint(System.currentTimeMillis(), 0) : points.get(0);
-        final double initialWeight = custom ? prefs().getFloat(KEY_BASE_WEIGHT + key, (float) first.value) : first.value;
-        final long initialDate = custom ? prefs().getLong(KEY_BASE_DATE + key, first.at) : first.at;
+    private void showPersonDialog(String person) {
+        PersonInfo info = diary.person(person);
+        Entry latest = diary.latest(person);
+        Diary.Base current = diary.base(person);
 
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(dp(22), dp(4), dp(22), 0);
-        TextView description = label("Escolha de onde a variação de " + person + " deve começar.", 13, MUTED, false);
-        body.addView(description, lp(-1, -2, 6));
+
+        body.addView(label("Nome", 12, palette.muted, false));
+        EditText name = new EditText(this);
+        name.setSingleLine(true);
+        name.setTextSize(16);
+        name.setTextColor(palette.ink);
+        name.setFilters(new InputFilter[]{new InputFilter.LengthFilter(MAX_NAME_LENGTH)});
+        name.setText(info.name);
+        name.setBackground(stroked(palette.field, palette.border, 10, 1));
+        name.setPadding(dp(12), 0, dp(10), 0);
+        body.addView(name, lp(-1, dp(48), 4));
+
+        body.addView(label("Meta de peso (opcional)", 12, palette.muted, false), lp(-1, -2, 12));
+        EditText goal = new EditText(this);
+        goal.setSingleLine(true);
+        goal.setTextSize(16);
+        goal.setTextColor(palette.ink);
+        goal.setHint("vazio = sem meta");
+        goal.setKeyListener(DigitsKeyListener.getInstance("0123456789,."));
+        goal.setRawInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        if (info.hasGoal()) goal.setText(WeightFormat.format(info.goalKg));
+        goal.setBackground(stroked(palette.field, palette.border, 10, 1));
+        goal.setPadding(dp(12), 0, dp(10), 0);
+        body.addView(goal, lp(-1, dp(48), 4));
+
         CheckBox automatic = new CheckBox(this);
-        automatic.setText("Usar a primeira marcação automaticamente");
-        automatic.setTextColor(INK);
+        automatic.setText("Usar a primeira marcação como base");
+        automatic.setTextColor(palette.ink);
         automatic.setTextSize(14);
-        automatic.setChecked(!custom);
-        body.addView(automatic, lp(-1, -2, 4));
+        automatic.setChecked(!info.baseCustom);
+        body.addView(automatic, lp(-1, -2, 14));
 
-        final EditText weight = new EditText(this);
-        weight.setSingleLine(true);
-        weight.setTextSize(17);
-        weight.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        weight.setHint("Peso de referência em kgf");
-        if (initialWeight > 0) weight.setText(formatWeight(initialWeight));
-        weight.setPadding(dp(12), 0, dp(10), 0);
-        weight.setBackground(stroked(Color.WHITE, BORDER, 10, 1));
-        body.addView(weight, lp(-1, dp(50), 4));
+        final EditText baseWeight = new EditText(this);
+        baseWeight.setSingleLine(true);
+        baseWeight.setTextSize(16);
+        baseWeight.setTextColor(palette.ink);
+        baseWeight.setHint("Peso de referência em kgf");
+        baseWeight.setKeyListener(DigitsKeyListener.getInstance("0123456789,."));
+        baseWeight.setRawInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        baseWeight.setBackground(stroked(palette.field, palette.border, 10, 1));
+        baseWeight.setPadding(dp(12), 0, dp(10), 0);
+        if (current != null) baseWeight.setText(WeightFormat.format(current.kg));
+        body.addView(baseWeight, lp(-1, dp(48), 4));
 
-        final Button date = button("📅  " + fullDate(initialDate), Color.rgb(246, 249, 246), INK, false);
-        body.addView(date, lp(-1, dp(46), 4));
-        automatic.setOnCheckedChangeListener((buttonView, checked) -> {
-            weight.setEnabled(!checked);
-            date.setEnabled(!checked);
-            weight.setAlpha(checked ? .45f : 1f);
-            date.setAlpha(checked ? .45f : 1f);
-        });
-        weight.setEnabled(custom);
-        date.setEnabled(custom);
-        weight.setAlpha(custom ? 1f : .45f);
-        date.setAlpha(custom ? 1f : .45f);
-
-        final long[] chosenDateValue = new long[]{initialDate};
-        date.setOnClickListener(v -> {
+        final long[] baseAt = {current != null ? current.at : (latest != null ? latest.at : System.currentTimeMillis())};
+        final Button baseDate = button("📅  " + DateText.fullDate(baseAt[0]), palette.field, palette.ink, false);
+        body.addView(baseDate, lp(-1, dp(48), 4));
+        baseDate.setOnClickListener(v -> {
             Calendar c = Calendar.getInstance();
-            c.setTimeInMillis(chosenDateValue[0]);
-            new DatePickerDialog(this, (view, year, month, day) -> {
-                Calendar picked = Calendar.getInstance();
-                picked.setTimeInMillis(chosenDateValue[0]);
-                picked.set(Calendar.YEAR, year);
-                picked.set(Calendar.MONTH, month);
-                picked.set(Calendar.DAY_OF_MONTH, day);
-                chosenDateValue[0] = picked.getTimeInMillis();
-                date.setText("📅  " + fullDate(chosenDateValue[0]));
-            }, c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH)).show();
+            c.setTimeInMillis(baseAt[0]);
+            DatePickerDialog picker = new DatePickerDialog(this, (view, year, month, day) -> {
+                baseAt[0] = DateText.withDate(baseAt[0], year, month, day);
+                baseDate.setText("📅  " + DateText.fullDate(baseAt[0]));
+            }, c.get(Calendar.YEAR), c.get(Calendar.MONTH), c.get(Calendar.DAY_OF_MONTH));
+            picker.getDatePicker().setMaxDate(System.currentTimeMillis());
+            picker.show();
         });
+
+        automatic.setOnCheckedChangeListener((view, checked) -> {
+            baseWeight.setEnabled(!checked);
+            baseDate.setEnabled(!checked);
+            baseWeight.setAlpha(checked ? .45f : 1f);
+            baseDate.setAlpha(checked ? .45f : 1f);
+        });
+        boolean custom = !automatic.isChecked();
+        baseWeight.setEnabled(custom);
+        baseDate.setEnabled(custom);
+        baseWeight.setAlpha(custom ? 1f : .45f);
+        baseDate.setAlpha(custom ? 1f : .45f);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("Base de " + person)
+                .setTitle("Configurar " + info.name)
                 .setView(body)
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Salvar base", null)
+                .setPositiveButton("Salvar", null)
                 .create();
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-            if (automatic.isChecked()) {
-                if (points.isEmpty()) {
-                    Toast.makeText(this, "Ainda não há uma primeira marcação para usar.", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                prefs().edit().putBoolean(KEY_BASE_CUSTOM + key, false).apply();
-            } else {
-                Double value = parseWeight(weight);
-                if (value == null) {
-                    weight.setError("Digite um peso válido");
-                    return;
-                }
-                prefs().edit()
-                        .putBoolean(KEY_BASE_CUSTOM + key, true)
-                        .putFloat(KEY_BASE_WEIGHT + key, value.floatValue())
-                        .putLong(KEY_BASE_DATE + key, chosenDateValue[0])
-                        .apply();
+            String newName = name.getText().toString().trim();
+            if (newName.isEmpty() || newName.length() > MAX_NAME_LENGTH) {
+                name.setError("Use de 1 a 30 caracteres.");
+                return;
             }
-            dialog.dismiss();
-            refreshUi();
+            double goalKg = Double.NaN;
+            if (!WeightFormat.isBlank(goal.getText().toString())) {
+                Double parsed = WeightFormat.parse(goal.getText().toString());
+                if (parsed == null) {
+                    goal.setError(WEIGHT_ERROR);
+                    return;
+                }
+                goalKg = parsed;
+            }
+            boolean auto = automatic.isChecked();
+            Double baseKg = null;
+            if (!auto) {
+                baseKg = WeightFormat.parse(baseWeight.getText().toString());
+                if (baseKg == null) {
+                    baseWeight.setError(WEIGHT_ERROR);
+                    return;
+                }
+            }
+            Diary next = diary.copy();
+            PersonInfo edited = next.person(person);
+            edited.name = newName;
+            edited.goalKg = goalKg;
+            edited.baseCustom = !auto;
+            if (!auto) {
+                edited.baseKg = baseKg;
+                edited.baseAt = baseAt[0];
+            }
+            if (commit(next)) {
+                dialog.dismiss();
+                refreshUi(true);
+            }
         }));
         dialog.show();
     }
 
-    private WeightPoint comparisonBase(boolean isElisa, ArrayList<WeightPoint> points) {
-        String key = isElisa ? "elisa" : "lucas";
-        if (prefs().getBoolean(KEY_BASE_CUSTOM + key, false)) {
-            return new WeightPoint(prefs().getLong(KEY_BASE_DATE + key, points.get(0).at),
-                    prefs().getFloat(KEY_BASE_WEIGHT + key, (float) points.get(0).value));
-        }
-        return points.get(0);
+    private void showAbout() {
+        new AlertDialog.Builder(this)
+                .setTitle("Peso a dois")
+                .setMessage("Versão " + versionName() + "\n\nSeus dados ficam apenas neste aparelho.")
+                .setPositiveButton("Entendi", null)
+                .show();
     }
 
-    private ArrayList<WeightPoint> readPoints(String person) {
-        SharedPreferences data = prefs();
-        int count = data.getInt("count_" + person, 0);
-        ArrayList<WeightPoint> points = new ArrayList<>();
-        for (int i = 0; i < count; i++) {
-            String weight = data.getString("weight_" + person + "_" + i, "");
-            long at = data.getLong("date_" + person + "_" + i, 0L);
-            try {
-                if (!weight.isEmpty() && at > 0) points.add(new WeightPoint(at, Double.parseDouble(weight)));
-            } catch (NumberFormatException ignored) { }
-        }
-        Collections.sort(points, (a, b) -> Long.compare(a.at, b.at));
-        return points;
-    }
-
-    private void appendPoint(String person, WeightPoint point) {
-        SharedPreferences data = prefs();
-        int count = data.getInt("count_" + person, 0);
-        data.edit()
-                .putInt("count_" + person, count + 1)
-                .putString("weight_" + person + "_" + count, Double.toString(point.value))
-                .putLong("date_" + person + "_" + count, point.at)
-                .apply();
-    }
-
-    private SharedPreferences prefs() {
-        return getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-    }
-
-    private long registrationTimestamp() {
-        if (!manuallySelectedDate) return System.currentTimeMillis();
-        Calendar selected = Calendar.getInstance();
-        selected.setTimeInMillis(selectedAt);
-        Calendar now = Calendar.getInstance();
-        selected.set(Calendar.HOUR_OF_DAY, now.get(Calendar.HOUR_OF_DAY));
-        selected.set(Calendar.MINUTE, now.get(Calendar.MINUTE));
-        selected.set(Calendar.SECOND, now.get(Calendar.SECOND));
-        selected.set(Calendar.MILLISECOND, now.get(Calendar.MILLISECOND));
-        return selected.getTimeInMillis();
-    }
-
-    private static boolean hasText(EditText edit) {
-        return edit != null && edit.getText() != null && edit.getText().toString().trim().length() > 0;
-    }
-
-    private static Double parseWeight(EditText edit) {
-        if (!hasText(edit)) return null;
+    private String versionName() {
         try {
-            String raw = edit.getText().toString().trim().replace(',', '.');
-            double value = Double.parseDouble(raw);
-            return value >= 1.0 && value <= 500.0 ? value : null;
-        } catch (NumberFormatException error) {
-            return null;
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException error) {
+            return "?";
         }
     }
 
-    private static String formatWeight(double value) {
-        return String.format(PT_BR, "%.1f", value);
-    }
-
-    private static String shortDate(long at) {
-        return new SimpleDateFormat("dd/MM/yyyy", PT_BR).format(new Date(at));
-    }
-
-    private static String shortDateTime(long at) {
-        return new SimpleDateFormat("dd/MM/yyyy · HH:mm", PT_BR).format(new Date(at));
-    }
-
-    private static String fullDate(long at) {
-        String value = new SimpleDateFormat("EEEE, d 'de' MMMM", PT_BR).format(new Date(at));
-        return value.substring(0, 1).toUpperCase(PT_BR) + value.substring(1);
-    }
+    // ------------------------------------------------------------------ helpers de view
 
     private TextView label(String text, float size, int color, boolean bold) {
         TextView view = new TextView(this);
@@ -592,8 +1124,10 @@ public final class MainActivity extends Activity {
         button.setAllCaps(false);
         button.setTypeface(Typeface.DEFAULT, bold ? Typeface.BOLD : Typeface.NORMAL);
         button.setPadding(dp(12), 0, dp(12), 0);
-        button.setMinHeight(0);
+        button.setMinHeight(dp(48));
+        button.setMinimumHeight(dp(48));
         button.setMinWidth(0);
+        button.setMinimumWidth(0);
         button.setBackground(round(background, 12));
         return button;
     }
@@ -602,12 +1136,12 @@ public final class MainActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(16), dp(16), dp(16), dp(16));
-        box.setBackground(stroked(SURFACE, BORDER, 16, 1));
+        box.setBackground(stroked(palette.surface, palette.border, 16, 1));
         return box;
     }
 
-    private TextView dot(int color) {
-        TextView view = label("", 1, color, false);
+    private View dot(int color) {
+        View view = new View(this);
         view.setBackground(round(color, 8));
         return view;
     }
@@ -624,7 +1158,7 @@ public final class MainActivity extends Activity {
         return params;
     }
 
-    private int dp(int value) {
+    private int dp(float value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
@@ -639,128 +1173,5 @@ public final class MainActivity extends Activity {
         GradientDrawable drawable = round(color, radiusDp);
         drawable.setStroke(dp(strokeDp), strokeColor);
         return drawable;
-    }
-
-    private static final class WeightPoint {
-        final long at;
-        final double value;
-
-        WeightPoint(long at, double value) {
-            this.at = at;
-            this.value = value;
-        }
-    }
-
-    private static final class HistoryRow {
-        final long at;
-        final double elisa;
-        final double lucas;
-
-        HistoryRow(long at, double elisa, double lucas) {
-            this.at = at;
-            this.elisa = elisa;
-            this.lucas = lucas;
-        }
-    }
-
-    private final class WeightChart extends View {
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private ArrayList<WeightPoint> elisa = new ArrayList<>();
-        private ArrayList<WeightPoint> lucas = new ArrayList<>();
-
-        WeightChart(Context context) {
-            super(context);
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-        }
-
-        void setData(ArrayList<WeightPoint> first, ArrayList<WeightPoint> second) {
-            elisa = first;
-            lucas = second;
-            invalidate();
-        }
-
-        @Override protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            float density = getResources().getDisplayMetrics().density;
-            float left = 44 * density;
-            float right = getWidth() - 13 * density;
-            float top = 16 * density;
-            float bottom = getHeight() - 34 * density;
-            ArrayList<WeightPoint> all = new ArrayList<>();
-            all.addAll(elisa);
-            all.addAll(lucas);
-            if (all.isEmpty()) {
-                paint.setColor(MUTED);
-                paint.setTextSize(13 * density);
-                paint.setTextAlign(Paint.Align.CENTER);
-                canvas.drawText("Registre uma pesagem para ver o gráfico", getWidth() / 2f,
-                        getHeight() / 2f, paint);
-                return;
-            }
-            long minAt = all.get(0).at;
-            long maxAt = all.get(0).at;
-            double minWeight = all.get(0).value;
-            double maxWeight = all.get(0).value;
-            for (WeightPoint point : all) {
-                minAt = Math.min(minAt, point.at);
-                maxAt = Math.max(maxAt, point.at);
-                minWeight = Math.min(minWeight, point.value);
-                maxWeight = Math.max(maxWeight, point.value);
-            }
-            if (minAt == maxAt) {
-                minAt -= 12 * 60 * 60 * 1000L;
-                maxAt += 12 * 60 * 60 * 1000L;
-            }
-            double range = maxWeight - minWeight;
-            if (range < .5) range = 2.0;
-            minWeight -= range * .18;
-            maxWeight += range * .18;
-            paint.setStrokeWidth(1 * density);
-            paint.setTextSize(10 * density);
-            paint.setTextAlign(Paint.Align.RIGHT);
-            for (int i = 0; i <= 4; i++) {
-                float y = bottom - ((bottom - top) * i / 4f);
-                paint.setColor(BORDER);
-                canvas.drawLine(left, y, right, y, paint);
-                paint.setColor(MUTED);
-                double value = minWeight + (maxWeight - minWeight) * i / 4.0;
-                canvas.drawText(formatWeight(value), left - 7 * density, y + 4 * density, paint);
-            }
-            paint.setTextAlign(Paint.Align.LEFT);
-            paint.setColor(MUTED);
-            canvas.drawText(shortDate(minAt), left, bottom + 23 * density, paint);
-            paint.setTextAlign(Paint.Align.RIGHT);
-            canvas.drawText(shortDate(maxAt), right, bottom + 23 * density, paint);
-            drawLine(canvas, elisa, CORAL, minAt, maxAt, minWeight, maxWeight, left, right, top, bottom, density);
-            drawLine(canvas, lucas, GREEN, minAt, maxAt, minWeight, maxWeight, left, right, top, bottom, density);
-        }
-
-        private void drawLine(Canvas canvas, List<WeightPoint> points, int color, long minAt,
-                              long maxAt, double minWeight, double maxWeight, float left,
-                              float right, float top, float bottom, float density) {
-            if (points.isEmpty()) return;
-            Path path = new Path();
-            for (int i = 0; i < points.size(); i++) {
-                WeightPoint point = points.get(i);
-                float x = left + (float) ((point.at - minAt) / (double) (maxAt - minAt)) * (right - left);
-                float y = bottom - (float) ((point.value - minWeight) / (maxWeight - minWeight)) * (bottom - top);
-                if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
-            }
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(2.5f * density);
-            paint.setStrokeCap(Paint.Cap.ROUND);
-            paint.setStrokeJoin(Paint.Join.ROUND);
-            paint.setColor(color);
-            canvas.drawPath(path, paint);
-            paint.setStyle(Paint.Style.FILL);
-            for (WeightPoint point : points) {
-                float x = left + (float) ((point.at - minAt) / (double) (maxAt - minAt)) * (right - left);
-                float y = bottom - (float) ((point.value - minWeight) / (maxWeight - minWeight)) * (bottom - top);
-                paint.setColor(Color.WHITE);
-                canvas.drawCircle(x, y, 4.3f * density, paint);
-                paint.setColor(color);
-                canvas.drawCircle(x, y, 2.8f * density, paint);
-            }
-        }
     }
 }
